@@ -48,7 +48,7 @@ It sees every JSON-RPC message and enforces a policy:
 
 | Defense | How |
 |---|---|
-| **Exfiltration blocking** | Output of `private` tools is fingerprinted with **winnowing** (the algorithm behind Stanford's MOSS plagiarism detector). Calls to `sink` tools are checked for those fingerprints after peeling **URL / base64 / hex** encodings, nested up to 3 layers deep. Only hashes are stored, never your data. |
+| **Exfiltration blocking** | Output of `private` tools is fingerprinted with **winnowing** (the algorithm behind the MOSS plagiarism detector). Calls to `sink` tools are checked for those fingerprints after peeling **URL / base64 / hex** encodings, nested up to 3 layers deep. Only hashes are stored, never your data. |
 | **Lethal-trifecta detection** | Taint labels (`private`, `untrusted`, `sink`) are tracked per *client session* **across servers**, so private data from server A plus an injection from server B plus a sink on server C is caught. |
 | **Tool-poisoning quarantine** | Tool names, descriptions and JSON-schema text are scanned for injected instructions, fake `<IMPORTANT>` tags, references to `~/.ssh` & co., and **cross-tool shadowing**. Poisoned tools are removed from `tools/list` before the model sees them. |
 | **Rug-pull protection** | Tool definitions are pinned (SHA-256, trust on first use). A changed tool is quarantined until you run `sluice pins approve`. |
