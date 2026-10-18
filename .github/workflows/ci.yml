@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]" ruff
+      - run: ruff check src tests bench
+      - run: python -m pytest -v
+      - run: sluice demo --fast
+
+  scan-example:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e .
+      - name: Scan the bundled example config (expected to find issues)
+        run: sluice scan examples/claude_desktop_config.json --format sarif -o sluice.sarif --fail-on never
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: sluice.sarif
+          category: sluice-example

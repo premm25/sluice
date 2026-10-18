@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "notes": {
+      "command": "python",
+      "args": ["-m", "sluice.demo.server", "notes"]
+    },
+    "web": {
+      "command": "python",
+      "args": ["-m", "sluice.demo.server", "web"]
+    },
+    "weather": {
+      "command": "python",
+      "args": ["-m", "sluice.demo.server", "weather"]
+    }
+  }
+}

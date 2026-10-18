@@ -1,0 +1,37 @@
+# A locked-down profile: allowlist only, block the lethal trifecta outright,
+# withhold tool output that looks like a prompt injection.
+
+mode = "enforce"
+default_action = "deny"
+
+[detect]
+tool_poisoning = "block"
+output_injection = "block"
+
+[flow]
+exfiltration = "block"
+trifecta = "block"
+min_matches = 1
+
+[[tools]]
+match = "filesystem:*"
+labels = ["private"]
+
+[[tools]]
+match = "fetch:*"
+labels = ["untrusted", "sink"]
+
+[[rules]]
+match = "filesystem:read_*"
+[rules.args.path]
+within = ["~/projects"]
+
+[[rules]]
+match = "filesystem:list_*"
+
+[[rules]]
+match = "fetch:fetch"
+rate_limit = "30/minute"
+[rules.args.url]
+allow = ['^https://']
+deny = ['169\.254\.169\.254', '^https?://(localhost|127\.|10\.|192\.168\.)']
