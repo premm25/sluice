@@ -239,6 +239,21 @@ Measured with `python bench/bench.py` (Python 3.14, Windows 11, pure Python):
 
 Tool calls take hundreds of milliseconds and LLM turns take seconds, so Sluice's overhead doesn't show up in practice.
 
+### Verified against real servers
+
+Beyond the bundled toy servers, Sluice was tested against the official reference servers
+[`mcp-server-fetch`](https://pypi.org/project/mcp-server-fetch/) and
+[`mcp-server-time`](https://pypi.org/project/mcp-server-time/), which are built on the official MCP Python SDK.
+The test config was wrapped with `sluice wrap` and used no session environment variables:
+
+```
+11:07:46  ALLOW   fetch/fetch call                       # legitimate fetch of https://example.com
+11:07:48  REDACT  notes/read_note result secret_redacted
+11:07:48  WARN    fetch/fetch call session holds private data (notes/read_note) and untrusted content (fetch/fetch) ...
+11:07:48  BLOCK   fetch/fetch call arguments contain 22 content fingerprint(s) from private source
+                  notes/read_note (hidden via base64 encoding)   # never reached the network
+```
+
 ## Threat model and limitations
 
 Sluice is a deterministic enforcement layer. It doesn't rely on another LLM, so a cleverly worded
@@ -267,7 +282,7 @@ practical subset of that approach to existing MCP clients without modifying them
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest            # 131 tests: unit, property and real-subprocess integration
+python -m pytest            # 132 tests: unit, property and real-subprocess integration
 python -m ruff check src tests bench
 python bench/bench.py
 ```

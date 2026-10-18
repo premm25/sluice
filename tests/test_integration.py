@@ -93,6 +93,13 @@ def test_proxy_exit_code_follows_server(tmp_path):
     assert proc.returncode == 3
 
 
+def test_proxy_terminates_server_that_ignores_eof():
+    stubborn = "import time\nwhile True: time.sleep(1)"
+    proc = subprocess.run([PY, "-m", "sluice", "run", "--quiet", "--", PY, "-c", stubborn],
+                          input=b"", capture_output=True, timeout=60)
+    assert proc.returncode != 0  # terminated after the grace period instead of hanging
+
+
 def test_demo_runs_clean(capsys):
     assert main(["demo", "--fast"]) == 0
     out = capsys.readouterr().out

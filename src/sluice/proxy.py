@@ -23,6 +23,8 @@ from sluice.engine import Engine, Verdict, blocked_result
 
 log = logging.getLogger("sluice")
 
+SHUTDOWN_GRACE = 5.0
+
 
 def resolve_command(cmd: list[str]) -> list[str]:
     """Resolve the executable via PATH (finds ``npx.cmd`` & co. on Windows)."""
@@ -104,7 +106,12 @@ def run_proxy(cmd: list[str], engine: Engine, stdin: BinaryIO | None = None,
             for line in iter(client_in.readline, b""):
                 _process_line(line, engine.from_client, server_in, client_out, from_client=True)
         finally:
-            server_in.close()  # client went away: let the server shut down
+            server_in.close()  # client went away: let the server shut down...
+            try:
+                proc.wait(timeout=SHUTDOWN_GRACE)
+            except subprocess.TimeoutExpired:  # ...and make it, if it ignores EOF
+                log.warning("server did not exit %ss after the client disconnected; terminating", SHUTDOWN_GRACE)
+                proc.terminate()
 
     def pump_server() -> None:
         for line in iter(server_out.readline, b""):
