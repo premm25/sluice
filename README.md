@@ -204,6 +204,38 @@ Validate a policy and dry-run a decision before deploying it:
 sluice policy check policy.toml --tool fs:read_file --args '{"path": "~/.ssh/id_rsa"}'
 ```
 
+### Learn a policy, test it, then enforce it
+
+> **Status:** `record`, `learn` and `replay` were verified with manual real-process runs but have
+> **no automated tests yet**. Split-leak detection is **experimental and untested**.
+
+Writing a least-privilege policy by hand is tedious, so most people don't. Sluice can write one for you:
+
+1. **Record.** `sluice run` records each session: tool definitions, call arguments (secrets
+   redacted) and *fingerprints* of results. Result text is never stored. Turn this off with
+   `[record] enabled = false`.
+2. **Learn.** `sluice learn -o policy.toml` writes a policy that allows only what your agent
+   actually did: the tools it used, the folders it read (`within`), the hosts it called (for API-style
+   tools), and a burst rate limit at 3× the observed peak. Unused tools are denied.
+   Learning never weakens flow control on its own. Calls stopped as exfiltration are left out, and
+   their data flows are written as commented-out suggestions for you to review.
+3. **Replay.** `sluice replay --policy policy.toml` re-runs the recorded sessions against the candidate
+   policy, in order and on their original timestamps, and lists every call that would be **newly blocked**
+   or **newly allowed**, with reasons. Use `--fail-on blocked` in CI to review policy changes like code.
+
+```
+$ sluice replay --policy strict.toml
+Replayed 8 recorded call(s) from 1 session(s) against strict.toml
+  ✗ 2 call(s) newly BLOCKED
+      2026-10-22 01:14  web/fetch  {"url": "https://recipes.example/soup"}
+        ↳ session holds private data (notes/read_note) and untrusted content (web/fetch); ...
+  = 6 call(s) unchanged
+```
+
+**Split leaks (experimental).** Sluice also keeps a short in-memory history of what each sink sent to
+each destination, and checks the combined history for private-data fingerprints. This targets data
+sent out in many small pieces, each too small to recognise on its own.
+
 ## CLI
 
 | Command | |
@@ -215,6 +247,9 @@ sluice policy check policy.toml --tool fs:read_file --args '{"path": "~/.ssh/id_
 | `sluice audit tail \| verify \| stats \| report` | inspect the hash-chained log; HTML report |
 | `sluice pins list \| approve \| reset` | manage rug-pull pins |
 | `sluice session list \| clear` | inspect or reset taint |
+| `sluice learn [-o FILE] [--since 7d] [--strict]` | generate a least-privilege policy from recorded traffic |
+| `sluice replay [--policy P] [--fail-on blocked]` | show what a policy change would block or allow |
+| `sluice record list \| clear` | inspect or delete recorded traffic |
 | `sluice demo` | the scripted attack shown above |
 
 ### CI usage

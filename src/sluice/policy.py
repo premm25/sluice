@@ -52,6 +52,9 @@ class FlowConfig:
     session_ttl: float = 12 * 3600
     kgram: int = 24
     window: int = 12
+    split_detection: str = "block"  # private data sent in pieces across several sink calls
+    split_window: float = 600       # seconds of outbound history kept per destination (memory only)
+    split_max_chars: int = 20_000   # per-stream cap on that history
     # Declassification: "source_glob -> sink_glob" flows that are permitted,
     # e.g. "filesystem:* -> github:create_pull_request".
     allow_flows: list[str] = field(default_factory=list)
@@ -62,6 +65,14 @@ class FlowConfig:
             if _match(src, *source) and _match(dst, *sink):
                 return True
         return False
+
+
+@dataclass
+class RecordConfig:
+    # Records tool definitions, call arguments (secrets redacted) and *fingerprints*
+    # of results -- never result text -- for `sluice replay` and `sluice learn`.
+    enabled: bool = True
+    retain_days: float = 14
 
 
 @dataclass
@@ -111,6 +122,7 @@ class Policy:
     detect: DetectConfig = field(default_factory=DetectConfig)
     pinning: PinningConfig = field(default_factory=PinningConfig)
     flow: FlowConfig = field(default_factory=FlowConfig)
+    record: RecordConfig = field(default_factory=RecordConfig)
     rules: list[Rule] = field(default_factory=list)
     tool_labels: list[ToolLabel] = field(default_factory=list)
     source: str = "<defaults>"
@@ -131,7 +143,7 @@ class Policy:
         return any(r.unconditional_deny and r.matches(server, tool) for r in self.rules)
 
     def evaluate(self, server: str, tool: str, args: dict[str, Any],
-                 limiter: RateLimiter | None = None) -> list[Violation]:
+                 limiter: RateLimiter | None = None, now: float | None = None) -> list[Violation]:
         matched = [r for r in self.rules if r.matches(server, tool)]
         if not matched:
             if self.default_action == "deny":
@@ -146,7 +158,7 @@ class Policy:
             out.extend(problems)
             if not problems and rule.rate_limit and limiter is not None:
                 cap, period = rule.rate_limit
-                if not limiter.allow((rule.index, server, tool), cap, period):
+                if not limiter.allow((rule.index, server, tool), cap, period, now=now):
                     out.append(Violation("rate_limit", f"rate limit {rule.rate_spec} exceeded"))
         return out
 
@@ -257,7 +269,7 @@ def _regexes(where: str, values: Any) -> list[re.Pattern[str]]:
 
 
 def from_dict(data: dict[str, Any], source: str = "<dict>") -> Policy:
-    _check_keys("policy", data, {"mode", "default_action", "detect", "pinning", "flow", "tools", "rules"})
+    _check_keys("policy", data, {"mode", "default_action", "detect", "pinning", "flow", "record", "tools", "rules"})
     p = Policy(source=source)
     p.mode = _choice("policy", "mode", data.get("mode", p.mode), ("enforce", "monitor"))
     p.default_action = _choice("policy", "default_action", data.get("default_action", p.default_action),
@@ -279,11 +291,20 @@ def from_dict(data: dict[str, Any], source: str = "<dict>") -> Policy:
     p.flow = FlowConfig(**flow)
     _choice("flow", "exfiltration", p.flow.exfiltration, ACTIONS3)
     _choice("flow", "trifecta", p.flow.trifecta, ACTIONS3)
+    _choice("flow", "split_detection", p.flow.split_detection, ACTIONS3)
+    if p.flow.split_window <= 0 or p.flow.split_max_chars < 64:
+        raise PolicyError("[flow] split_window must be > 0 and split_max_chars >= 64")
     if p.flow.min_matches < 1 or p.flow.kgram < 8 or p.flow.window < 1:
         raise PolicyError("[flow] min_matches >= 1, kgram >= 8 and window >= 1 are required")
     for rule in p.flow.allow_flows:
         if not isinstance(rule, str) or "->" not in rule:
             raise PolicyError(f"[flow] allow_flows entries look like 'source_glob -> sink_glob', got {rule!r}")
+
+    rec = data.get("record", {})
+    _check_keys("record", rec, set(RecordConfig.__dataclass_fields__))
+    p.record = RecordConfig(**rec)
+    if p.record.retain_days <= 0:
+        raise PolicyError("[record] retain_days must be > 0")
 
     for i, entry in enumerate(data.get("tools", [])):
         where = f"tools[{i}]"
@@ -371,10 +392,18 @@ exfiltration = "block"  # private data (even base64/hex/url-encoded) in a sink's
 trifecta = "warn"       # any sink call once the session saw private AND untrusted data
 min_matches = 2         # fingerprint matches required to call it a leak
 auto_label = true       # guess labels for tools not listed under [[tools]]
+split_detection = "block"  # private data trickled out in pieces across several sink calls
+split_window = 600         # seconds of outbound history kept per destination (in memory only)
 # Declassification: flows you *want* to allow, as "source_glob -> sink_glob".
 allow_flows = [
   # "filesystem:* -> github:create_pull_request",
 ]
+
+[record]
+# Keeps tool definitions, call arguments (secrets redacted) and fingerprints of
+# results -- never result text -- so `sluice learn` and `sluice replay` can work.
+enabled = true
+retain_days = 14
 
 # ---- Capability labels -------------------------------------------------------
 # private:   returns data that must not leave (files, mail, databases)

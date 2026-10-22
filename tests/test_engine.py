@@ -286,7 +286,7 @@ def test_inspection_failure_fails_closed(make_engine, monkeypatch):
 
     def boom(*a, **k):
         raise RuntimeError("detector crashed")
-    monkeypatch.setattr(h.engine.flow, "record_private", boom)
+    monkeypatch.setattr(h.engine.flow, "record_private_features", boom)
     out = h.engine.from_server(response(req, text_result(NOTE)))
     assert "error" in out.forward[0] and NOTE not in str(out.forward[0])
 

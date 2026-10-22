@@ -6,8 +6,10 @@ import argparse
 import datetime as dt
 import json
 import logging
+import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +50,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     if a.monitor:
         policy.mode = "monitor"
     store = _store()
-    store.gc(policy.flow.session_ttl * 2)
+    store.gc(policy.flow.session_ttl * 2, recordings_older_than=policy.record.retain_days * 86400)
     name = a.name or Path(cmd[-1]).stem or "server"
     engine = Engine(policy, store, server=name)
     logging.getLogger("sluice").info("protecting '%s' (%s mode, policy %s, session %s)",
@@ -255,6 +257,96 @@ def cmd_session(a: argparse.Namespace) -> int:
     return 0
 
 
+_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhdw])\s*$")
+
+
+def parse_since(value: str | None) -> float | None:
+    """``"7d"`` -> the timestamp 7 days ago."""
+    if not value:
+        return None
+    m = _DURATION_RE.match(value)
+    if not m:
+        raise SystemExit(f"sluice: invalid duration {value!r}; use e.g. 30m, 12h, 7d, 2w")
+    seconds = float(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+    return time.time() - seconds
+
+
+def _events(a: argparse.Namespace):
+    from sluice.recording import load_events
+    sessions = [a.session] if getattr(a, "session", None) else None
+    return load_events(_store(), since=parse_since(a.since), sessions=sessions, server=a.server)
+
+
+def cmd_learn(a: argparse.Namespace) -> int:
+    from sluice.learn import learn
+    from sluice.policy import from_dict
+    from sluice.replay import replay
+
+    events = _events(a)
+    if not any(e.kind == "call" for e in events):
+        print("sluice: no recorded tool calls to learn from. Run your MCP servers behind `sluice run` "
+              "(recording is on by default) and use your agent for a while first.", file=sys.stderr)
+        return 1
+    result = learn(events, _load_policy(a.base), strict=a.strict, default_action=a.default)
+    if a.output:
+        Path(a.output).write_text(result.toml, encoding="utf-8")
+    else:
+        sys.stdout.write(result.toml)
+
+    # Self-check: the learned policy must allow everything it learned from.
+    import tomllib
+    check = replay(from_dict(tomllib.loads(result.toml), source="learned policy"), events)
+    regressions = [c for c in check.newly_blocked if c.before == "allow"]
+    err = sys.stderr
+    print(f"learned {len(result.tools)} tool rule(s) from {result.calls} call(s) in {result.sessions} session(s)"
+          + (f"; wrote {a.output}" if a.output else ""), file=err)
+    if result.excluded:
+        print(f"  excluded {sum(result.excluded.values())} call(s) that were stopped for security reasons",
+              file=err)
+    if result.suggestions:
+        print(f"  {len(result.suggestions)} blocked data flow(s) listed as commented-out suggestions, not allowed",
+              file=err)
+    print(f"  replay check: {len(regressions)} of {check.calls} recorded call(s) would be newly blocked", file=err)
+    return 0
+
+
+def cmd_replay(a: argparse.Namespace) -> int:
+    from sluice.replay import render_text, replay
+
+    policy = _load_policy(a.policy)
+    report = replay(policy, _events(a))
+    if a.format == "json":
+        print(json.dumps(report.to_json(), indent=2, ensure_ascii=False))
+    else:
+        print(render_text(report, policy.source, show=a.show))
+    if a.fail_on == "any" and report.changes:
+        return 1
+    if a.fail_on == "blocked" and report.newly_blocked:
+        return 1
+    return 0
+
+
+def cmd_record(a: argparse.Namespace) -> int:
+    from sluice.recording import summarize
+
+    store = _store()
+    if a.record_cmd == "clear":
+        if a.session:
+            n = store.execute("DELETE FROM recordings WHERE session = ?", (a.session,)).rowcount
+        else:
+            n = store.execute("DELETE FROM recordings").rowcount
+        print(f"deleted {n} recorded event(s)")
+        return 0
+    rows = summarize(store)
+    if not rows:
+        print("nothing recorded yet")
+    for r in rows:
+        first = dt.datetime.fromtimestamp(r["first"]).strftime("%Y-%m-%d %H:%M")
+        last = dt.datetime.fromtimestamp(r["last"]).strftime("%H:%M")
+        print(f"{r['session']:<24} {first} → {last}  {r['calls']:>5} call(s)  {r['servers']} server(s)")
+    return 0
+
+
 def cmd_demo(a: argparse.Namespace) -> int:
     from sluice.demo.run import main as demo_main
     return demo_main(pace=0.0 if a.fast else 0.4)
@@ -335,6 +427,37 @@ def build_parser() -> argparse.ArgumentParser:
     pr = pns.add_parser("reset")
     pr.add_argument("server", nargs="?")
     pn.set_defaults(fn=cmd_pins)
+
+    def add_selection(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--since", help="only use traffic from this long ago, e.g. 12h, 7d")
+        sp.add_argument("--session", help="only use one recorded session")
+        sp.add_argument("--server", help="only use one server")
+
+    ln = sub.add_parser("learn", help="generate a least-privilege policy from recorded traffic")
+    add_selection(ln)
+    ln.add_argument("-o", "--output", help="write the policy here (default: stdout)")
+    ln.add_argument("--base", help="policy whose labels and flow settings to start from")
+    ln.add_argument("--strict", action="store_true",
+                    help="also allowlist browsing hosts and pin low-cardinality arguments with one_of")
+    ln.add_argument("--default", default="deny", choices=["deny", "allow"],
+                    help="default_action for tools never seen while learning (default: deny)")
+    ln.set_defaults(fn=cmd_learn)
+
+    rp = sub.add_parser("replay", help="show what a policy change would block or allow on recorded traffic")
+    add_selection(rp)
+    rp.add_argument("--policy", help="candidate policy (default: the active policy)")
+    rp.add_argument("--format", choices=["text", "json"], default="text")
+    rp.add_argument("--show", type=int, default=20, help="changes to list per category")
+    rp.add_argument("--fail-on", default="never", choices=["never", "blocked", "any"],
+                    help="exit 1 if calls become blocked (or change at all); useful in CI")
+    rp.set_defaults(fn=cmd_replay)
+
+    rc = sub.add_parser("record", help="inspect or delete recorded traffic")
+    rcs = rc.add_subparsers(dest="record_cmd", required=True)
+    rcs.add_parser("list")
+    rcc = rcs.add_parser("clear")
+    rcc.add_argument("--session")
+    rc.set_defaults(fn=cmd_record)
 
     se = sub.add_parser("session", help="inspect or clear taint state")
     ses = se.add_subparsers(dest="session_cmd", required=True)

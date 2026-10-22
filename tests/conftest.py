@@ -69,10 +69,10 @@ class Harness:
 @pytest.fixture
 def make_engine(store):
     def factory(policy: Policy | dict[str, Any] | None = None, server: str = "srv",
-                session: str = "s1", db: Store | None = None) -> Harness:
+                session: str = "s1", db: Store | None = None, **engine_kwargs: Any) -> Harness:
         if isinstance(policy, dict):
             policy = from_dict(policy)
-        return Harness(Engine(policy or Policy(), db or store, server=server, session=session))
+        return Harness(Engine(policy or Policy(), db or store, server=server, session=session, **engine_kwargs))
     return factory
 
 

@@ -12,6 +12,7 @@ taint is scoped to that session with a TTL.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -41,6 +42,10 @@ CREATE TABLE IF NOT EXISTS audit(
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, session TEXT, server TEXT,
     event TEXT NOT NULL, tool TEXT, decision TEXT, detail TEXT NOT NULL,
     prev TEXT NOT NULL, hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS recordings(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, session TEXT, server TEXT,
+    kind TEXT NOT NULL, tool TEXT, ref INTEGER, data TEXT NOT NULL, blob BLOB);
+CREATE INDEX IF NOT EXISTS ix_rec ON recordings(session, id);
 """
 
 _CHUNK = 500
@@ -146,11 +151,40 @@ class Store:
             for table in ("fingerprints", "tokens", "taint"):
                 c.execute(f"DELETE FROM {table} WHERE session = ?", (session,))
 
-    def gc(self, older_than: float) -> None:
-        cutoff = time.time() - older_than
+    def gc(self, older_than: float, recordings_older_than: float | None = None) -> None:
+        now = time.time()
         with self.transaction() as c:
             for table in ("fingerprints", "tokens", "taint"):
-                c.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
+                c.execute(f"DELETE FROM {table} WHERE ts < ?", (now - older_than,))
+            if recordings_older_than is not None:
+                c.execute("DELETE FROM recordings WHERE ts < ?", (now - recordings_older_than,))
+
+    # -- recordings (for `sluice replay` and `sluice learn`) -------------------
+
+    def add_recording(self, session: str, server: str, kind: str, tool: str | None,
+                      data: dict[str, Any], blob: bytes | None = None, ref: int | None = None,
+                      ts: float | None = None) -> int:
+        cur = self.execute(
+            "INSERT INTO recordings(ts, session, server, kind, tool, ref, data, blob) VALUES (?,?,?,?,?,?,?,?)",
+            (time.time() if ts is None else ts, session, server, kind, tool, ref,
+             json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str), blob))
+        return int(cur.lastrowid or 0)
+
+    def recordings(self, sessions: Iterable[str] | None = None, since: float | None = None,
+                   server: str | None = None) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM recordings WHERE 1=1"
+        params: list[Any] = []
+        if sessions is not None:
+            sessions = list(sessions)
+            sql += f" AND session IN ({','.join('?' * len(sessions))})" if sessions else " AND 0"
+            params.extend(sessions)
+        if since is not None:
+            sql += " AND ts >= ?"
+            params.append(since)
+        if server is not None:
+            sql += " AND server = ?"
+            params.append(server)
+        return self.query(sql + " ORDER BY id", params)
 
 
 class _Tx:

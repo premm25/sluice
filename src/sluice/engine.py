@@ -19,9 +19,11 @@ Server -> client
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,10 +38,11 @@ from sluice.detectors import (
     scan_tool,
     strip_hidden,
 )
-from sluice.flow import PRIVATE, SINK, UNTRUSTED, FlowTracker
+from sluice.flow import PRIVATE, SINK, UNTRUSTED, FlowTracker, LeakReport, SplitTracker, split_streams
 from sluice.pinning import PinStore
 from sluice.policy import Policy
 from sluice.ratelimit import RateLimiter
+from sluice.recording import pack_fingerprints, redact_tree
 from sluice.store import Store, default_session
 
 log = logging.getLogger("sluice")
@@ -51,6 +54,18 @@ JSON = dict[str, Any]
 class Verdict:
     forward: list[Any] = field(default_factory=list)  # continue to the other side
     reply: list[Any] = field(default_factory=list)    # send straight back to the sender
+
+
+@dataclass
+class CallDecision:
+    decision: str  # allow | warn | block | would_block
+    codes: list[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+    record_id: int | None = None
+
+    @property
+    def blocked(self) -> bool:
+        return self.decision == "block"
 
 
 @dataclass
@@ -111,18 +126,23 @@ def _collect_texts(result: JSON) -> str:
 
 class Engine:
     def __init__(self, policy: Policy, store: Store, server: str = "default",
-                 session: str | None = None):
+                 session: str | None = None, *, clock: Callable[[], float] = time.time,
+                 record: bool | None = None):
         self.policy = policy
         self.store = store
         self.server = server
         self.session = session or default_session()
+        self.clock = clock  # injectable so `sluice replay` can run on recorded time
+        self.record = policy.record.enabled if record is None else record
         self.audit = AuditLog(store, self.session, server)
         self.flow = FlowTracker(store, self.session, policy.flow.session_ttl,
                                 policy.flow.kgram, policy.flow.window)
+        self.split = SplitTracker(policy.flow.split_window, policy.flow.split_max_chars)
         self.pins = PinStore(store)
         self.limiter = RateLimiter()
         self.tools: dict[str, ToolInfo] = {}
-        self._pending: dict[str, tuple[str, str | None]] = {}
+        self._pending: dict[str, tuple[str, str | None, int | None]] = {}
+        self._listed: str | None = None
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ API
@@ -165,7 +185,7 @@ class Engine:
             return Verdict([msg])  # notification or a response to a server->client request
         if method == "tools/call":
             return self._on_call(msg)
-        self._pending[_key(msg["id"])] = (method, None)
+        self._pending[_key(msg["id"])] = (method, None, None)
         return Verdict([msg])
 
     def _server_one(self, msg: Any) -> Verdict:
@@ -176,12 +196,12 @@ class Engine:
         entry = self._pending.pop(_key(msg["id"]), None)
         if entry is None or "result" not in msg:
             return Verdict([msg])
-        method, tool = entry
+        method, tool, record_id = entry
         try:
             if method == "tools/list":
                 msg = self._on_tools_list(msg)
             elif method == "tools/call":
-                msg = self._on_call_result(msg, tool or "")
+                msg = self._on_call_result(msg, tool or "", record_id)
             elif method == "resources/read" and self.policy.flow.resources_private:
                 msg = self._on_resource(msg)
         except Exception as e:  # fail closed: never pass an uninspected result through
@@ -197,35 +217,73 @@ class Engine:
         params = msg.get("params") or {}
         name = str(params.get("name", ""))
         args = params.get("arguments") or {}
+        d = self.decide_call(name, args)
+        if d.blocked:
+            return Verdict(reply=[blocked_result(msg.get("id"), name, d.reasons)])
+        self._pending[_key(msg["id"])] = ("tools/call", name, d.record_id)
+        return Verdict([msg])
+
+    def _leak_found(self, leak: LeakReport, name: str, detail: dict[str, Any]) -> bool:
+        """Apply min_matches and declassification (allow_flows) to a leak report."""
+        declassified = {s for s in leak.sources if self.policy.flow.flow_allowed(s, (self.server, name))}
+        if declassified:
+            detail["declassified"] = sorted(f"{s}/{t}" for s, t in declassified)
+        if leak.leaked(self.policy.flow.min_matches) and leak.sources - declassified:
+            leak.sources -= declassified
+            return True
+        return False
+
+    def decide_call(self, name: str, args: Any) -> CallDecision:
+        """Every check for one tool call. Used live by the proxy and offline by `sluice replay`."""
+        with self._lock:
+            return self._decide_call(name, args if isinstance(args, dict) else {})
+
+    def _decide_call(self, name: str, args: dict[str, Any]) -> CallDecision:
+        now = self.clock()
         enforce = self.policy.enforce
+        flow = self.policy.flow
         blocks: list[tuple[str, str]] = []
         warns: list[tuple[str, str]] = []
 
         info = self.tools.get(name)
         if info and info.quarantine:
             blocks.append(("quarantined", info.quarantine))
-        for v in self.policy.evaluate(self.server, name, args, self.limiter):
+        for v in self.policy.evaluate(self.server, name, args, self.limiter, now=now):
             blocks.append((v.code, v.message))
 
         labels = self.labels(name)
         flow_detail: dict[str, Any] = {}
-        if SINK in labels and self.policy.flow.enabled:
-            if self.policy.flow.exfiltration != "off":
+        split_key: str | None = None
+        streams: dict[str, str] = {}
+        if SINK in labels and flow.enabled:
+            leaked = False
+            if flow.exfiltration != "off":
                 leak = self.flow.check_sink(args)
                 flow_detail["fingerprint_matches"] = leak.fingerprint_matches
                 flow_detail["token_matches"] = leak.token_matches
-                declassified = {s for s in leak.sources if self.policy.flow.flow_allowed(s, (self.server, name))}
-                if declassified:
-                    flow_detail["declassified"] = sorted(f"{s}/{t}" for s, t in declassified)
-                if leak.leaked(self.policy.flow.min_matches) and leak.sources - declassified:
-                    leak.sources -= declassified
-                    target = blocks if self.policy.flow.exfiltration == "block" else warns
-                    target.append(("exfiltration", leak.describe()))
-            if self.policy.flow.trifecta != "off":
+                if self._leak_found(leak, name, flow_detail):
+                    leaked = True
+                    (blocks if flow.exfiltration == "block" else warns).append(("exfiltration", leak.describe()))
+            if flow.split_detection != "off":
+                destination, streams = split_streams(args)
+                split_key = f"{self.server}/{name}|{destination}"
+                history = self.split.accumulated(split_key, streams, now)
+                if history and not leaked:
+                    leak = self.flow.check_sink({k: data for k, (_, data) in history.items()})
+                    if self._leak_found(leak, name, flow_detail):
+                        calls = max(n for n, _ in history.values())
+                        src = ", ".join(sorted(f"{s}/{t}" for s, t in leak.sources))
+                        flow_detail["split_calls"] = calls
+                        (blocks if flow.split_detection == "block" else warns).append((
+                            "split_exfiltration",
+                            f"data from private source {src} is being sent in pieces: the last {calls} calls to "
+                            f"{destination} together contain {leak.fingerprint_matches} content fingerprint(s)"
+                            + (f" and {leak.token_matches} secret/token value(s)" if leak.token_matches else "")))
+            if flow.trifecta != "off":
                 taint = self.flow.taint()
                 if taint.trifecta:
                     src = lambda xs: ", ".join(sorted({f"{s}/{t}" for s, t in xs}))  # noqa: E731
-                    target = blocks if self.policy.flow.trifecta == "block" else warns
+                    target = blocks if flow.trifecta == "block" else warns
                     target.append(("lethal_trifecta",
                                    f"session holds private data ({src(taint.private)}) and untrusted content "
                                    f"({src(taint.untrusted)}); '{name}' can send data out"))
@@ -235,23 +293,65 @@ class Engine:
             log.warning("[%s] warn %s: %s", self.server, name, message)
             self.audit.log("call", tool=name, decision="warn", code=code, reason=message, **detail)
 
+        codes = [c for c, _ in blocks] or [c for c, _ in warns]
+        reasons = [m for _, m in blocks] or [m for _, m in warns]
         if blocks:
-            reasons = [m for _, m in blocks]
-            codes = [c for c, _ in blocks]
+            decision = "block" if enforce else "would_block"
             if enforce:
                 log.warning("[%s] BLOCKED %s: %s", self.server, name, "; ".join(reasons))
-                self.audit.log("call", tool=name, decision="block", codes=codes, reasons=reasons,
-                               args=_preview(args), **detail)
-                return Verdict(reply=[blocked_result(msg.get("id"), name, reasons)])
-            self.audit.log("call", tool=name, decision="would_block", codes=codes, reasons=reasons,
+            self.audit.log("call", tool=name, decision=decision, codes=codes, reasons=reasons,
                            args=_preview(args), **detail)
-        elif not warns:
-            self.audit.log("call", tool=name, decision="allow", **detail)
+        else:
+            decision = "warn" if warns else "allow"
+            if not warns:
+                self.audit.log("call", tool=name, decision="allow", **detail)
 
-        self._pending[_key(msg["id"])] = ("tools/call", name)
-        return Verdict([msg])
+        if split_key is not None and decision != "block":
+            self.split.commit(split_key, streams, now)  # only data that actually left counts
 
-    def _on_call_result(self, msg: JSON, tool: str) -> JSON:
+        record_id = None
+        if self.record:
+            record_id = self.store.add_recording(
+                self.session, self.server, "call", name,
+                {"args": redact_tree(args), "decision": decision, "codes": codes, "reasons": reasons}, ts=now)
+        return CallDecision(decision, codes, reasons, record_id)
+
+    def _features(self, text: str, want_private: bool) -> tuple[set[int], set[str]]:
+        if text and (want_private or self.record):
+            return self.flow.features(text)
+        return set(), set()
+
+    def _record_result(self, kind: str, tool: str, ref: int | None, is_error: bool,
+                       fps: set[int], tokens: set[str]) -> None:
+        if self.record:
+            self.store.add_recording(
+                self.session, self.server, kind, tool,
+                {"is_error": is_error, "k": self.flow.k, "w": self.flow.w, "tokens": sorted(tokens)},
+                blob=pack_fingerprints(fps), ref=ref, ts=self.clock())
+
+    def ingest_result(self, tool: str, fps: set[int], tokens: set[str], is_error: bool = False,
+                      resource: bool = False) -> None:
+        """Replay a recorded result into flow state, as if its output had just passed through."""
+        with self._lock:
+            if not self.policy.flow.enabled or is_error:
+                return
+            if resource:
+                if self.policy.flow.resources_private and (fps or tokens):
+                    self.flow.record_private_features(self.server, "resources/read", fps, tokens)
+                return
+            labels = self.labels(tool)
+            if PRIVATE in labels and (fps or tokens):
+                self.flow.record_private_features(self.server, tool, fps, tokens)
+            if UNTRUSTED in labels:
+                self.flow.record_untrusted(self.server, tool)
+
+    def observe_tools(self, tools: list[JSON]) -> list[JSON]:
+        """Replay a recorded tools/list; returns the tools a client would be shown."""
+        with self._lock:
+            out = self._on_tools_list({"jsonrpc": "2.0", "id": 0, "result": {"tools": tools}})
+            return out["result"]["tools"]
+
+    def _on_call_result(self, msg: JSON, tool: str, record_id: int | None = None) -> JSON:
         result = msg["result"]
         if not isinstance(result, dict):
             return msg
@@ -269,12 +369,16 @@ class Engine:
                     result = _map_texts(result, strip_hidden)
                 text = strip_hidden(text)
 
-        if self.policy.flow.enabled and not result.get("isError"):
+        is_error = bool(result.get("isError"))
+        track = self.policy.flow.enabled and not is_error
+        fps, tokens = self._features(text, track and PRIVATE in labels)
+        if track:
             if PRIVATE in labels and text:
-                n = self.flow.record_private(self.server, tool, text)
+                n = self.flow.record_private_features(self.server, tool, fps, tokens)
                 log.debug("[%s] fingerprinted %d features from %s", self.server, n, tool)
             if UNTRUSTED in labels:
                 self.flow.record_untrusted(self.server, tool)
+        self._record_result("result", tool, record_id, is_error, fps, tokens)
 
         decision = "allow"
         if det.output_injection != "off":
@@ -314,11 +418,14 @@ class Engine:
         result = msg["result"]
         if not isinstance(result, dict):
             return msg
-        text = _collect_texts(result)
+        text = strip_hidden(_collect_texts(result))
         if self.policy.detect.strip_hidden_unicode and self.policy.enforce:
             result = _map_texts(result, strip_hidden)
-        if text and self.policy.flow.enabled:
-            self.flow.record_private(self.server, "resources/read", strip_hidden(text))
+        track = self.policy.flow.enabled and bool(text)
+        fps, tokens = self._features(text, track)
+        if track:
+            self.flow.record_private_features(self.server, "resources/read", fps, tokens)
+        self._record_result("resource", "resources/read", None, False, fps, tokens)
         return {**msg, "result": result}
 
     # ------------------------------------------------------------ tools/list
@@ -330,6 +437,11 @@ class Engine:
             return msg
         enforce = self.policy.enforce
         names = [str(t.get("name", "")) for t in tools if isinstance(t, dict)]
+        if self.record:
+            digest = hashlib.sha256(json.dumps(tools, sort_keys=True, default=str).encode()).hexdigest()
+            if digest != self._listed:  # don't re-record an unchanged list on every poll
+                self._listed = digest
+                self.store.add_recording(self.session, self.server, "list", None, {"tools": tools}, ts=self.clock())
         kept: list[JSON] = []
         for tool in tools:
             if not isinstance(tool, dict):
