@@ -142,3 +142,13 @@ def test_explicit_labels_override_auto():
 def test_auto_labels(name, props, expected):
     tool = {"inputSchema": {"properties": {p: {} for p in props}}}
     assert auto_labels(name, tool) == expected
+
+
+def test_annotations_add_labels_but_never_remove_them():
+    def t(**ann):
+        return {"annotations": ann}
+    assert auto_labels("lookup", t(openWorldHint=True, readOnlyHint=True)) == {"untrusted"}
+    assert auto_labels("do_thing", t(openWorldHint=True)) == {"sink"}
+    assert auto_labels("get_weather", t(openWorldHint=False)) == set()
+    # a server claiming a closed world cannot shed the sink label its name implies
+    assert "sink" in auto_labels("send_email", t(openWorldHint=False, readOnlyHint=True))

@@ -108,6 +108,24 @@ Or wrap a single server by hand:
 }
 ```
 
+**Remote (HTTP) servers.** For a server you reach by URL, run a local Sluice proxy in front of it and
+point your client at the local address instead:
+
+```bash
+sluice serve --upstream https://mcp.example.com/mcp --name example --port 8931 \
+             --header "Authorization: Bearer $TOKEN"     # optional: auth added on the way out
+```
+
+```jsonc
+{ "mcpServers": { "example": { "url": "http://127.0.0.1:8931/mcp" } } }
+```
+
+`sluice serve` speaks MCP's Streamable HTTP transport, both JSON responses and event streams, and
+inspects every message with the same engine as `sluice run`. It binds to 127.0.0.1 and rejects
+non-local browser `Origin`s, so a web page can't reach it through DNS rebinding. It was tested against
+the public [DeepWiki](https://mcp.deepwiki.com) MCP server. To share taint between `serve` and `run`
+proxies, give them the same `SLUICE_SESSION`.
+
 Not ready to enforce yet? Add `--monitor` (or `mode = "monitor"`) to log what *would* be
 blocked without changing anything. Then review with `sluice audit tail` or
 `sluice audit report -o report.html`.
@@ -165,8 +183,10 @@ tell the user instead of retrying.
 
 Tools get labels from `[[tools]]` entries in the policy. Failing that, a conservative heuristic
 looks at the tool name and its input schema: a `url`, `to` or `webhook` parameter means `sink`,
-and names like `read_file` or `query_db` mean `private`. Run `sluice scan` to see the labels it
-assigns to your tools.
+and names like `read_file` or `query_db` mean `private`. MCP tool annotations are used too
+(`openWorldHint` with `readOnlyHint` means `untrusted`, otherwise `sink`). Annotations come from the
+untrusted server, so they can only *add* labels. A server can't shed `sink` by claiming
+`openWorldHint: false`. Run `sluice scan` to see the labels it assigns to your tools.
 
 ## Policy
 
@@ -240,7 +260,8 @@ sent out in many small pieces, each too small to recognise on its own.
 
 | Command | |
 |---|---|
-| `sluice run [--policy P] [--name N] [--monitor] -- <cmd>` | run a server behind Sluice |
+| `sluice run [--policy P] [--name N] [--monitor] -- <cmd>` | run a local (stdio) server behind Sluice |
+| `sluice serve --upstream URL [--port 8931] [--header H]` | protect a remote (HTTP) server via a local proxy URL |
 | `sluice scan [CONFIG...] [--format text\|json\|sarif]` | audit configs; `--cmd <server...>` for one server |
 | `sluice wrap / unwrap CONFIG [--in-place]` | add or remove Sluice from a client config |
 | `sluice init`, `sluice policy check` | create and validate policies |
@@ -305,7 +326,8 @@ injection can't argue its way past it. It also doesn't claim more than it does:
 * **Injection detection is heuristic.** Pattern matching flags common phrasing and Unicode
   smuggling, but it is a tripwire, not a guarantee. The flow controls are the actual defense.
 * **Labels must be right.** Auto-labelling is a heuristic. Label your important tools explicitly.
-* **stdio only.** Remote (Streamable HTTP) servers are reported by `scan` but not yet proxied.
+* **Remote servers need `sluice serve`.** `wrap` only rewrites stdio servers, and `scan` doesn't
+  launch remote ones yet. Point the client at a `sluice serve` URL by hand.
 * Sluice protects the *tool boundary*. It can't stop a client that renders attacker-controlled
   markdown images. That channel is outside MCP, though Sluice does flag such images in tool output.
 
@@ -317,7 +339,7 @@ practical subset of that approach to existing MCP clients without modifying them
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest            # 132 tests: unit, property and real-subprocess integration
+python -m pytest            # 150 tests: unit, property, HTTP and real-subprocess integration
 python -m ruff check src tests bench
 python bench/bench.py
 ```

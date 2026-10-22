@@ -63,4 +63,19 @@ def auto_labels(name: str, tool: dict[str, Any] | None = None) -> set[str]:
         labels.add(UNTRUSTED)
     if tokens & PRIVATE_WORDS and not is_sink_verb and not (tokens & {"web", "url", "browse", "browser"}):
         labels.add(PRIVATE)
+    labels |= annotation_labels(tool)
     return labels
+
+
+def annotation_labels(tool: dict[str, Any] | None) -> set[str]:
+    """Labels implied by MCP tool annotations (``openWorldHint``, ``readOnlyHint``).
+
+    Annotations are claims made by the (untrusted) server, so they may only
+    *add* labels -- a malicious server must not be able to shed ``sink`` by
+    declaring ``openWorldHint: false``.
+    """
+    ann = (tool or {}).get("annotations")
+    if not isinstance(ann, dict) or ann.get("openWorldHint") is not True:
+        return set()
+    # Open world + read-only: it fetches outside content. Open world + writes: it acts outside.
+    return {UNTRUSTED} if ann.get("readOnlyHint") is True else {SINK}

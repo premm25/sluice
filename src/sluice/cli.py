@@ -12,6 +12,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from sluice import __version__
 
@@ -35,6 +36,33 @@ def _store():
 
 
 # ---------------------------------------------------------------- commands
+
+def cmd_serve(a: argparse.Namespace) -> int:
+    import os
+
+    from sluice.http_proxy import HttpProxy, serve
+
+    level = logging.ERROR if a.quiet else getattr(logging, a.log_level.upper())
+    logging.basicConfig(stream=sys.stderr, level=level, format="[sluice] %(message)s")
+    policy = _load_policy(a.policy)
+    if a.monitor:
+        policy.mode = "monitor"
+    headers = {}
+    for h in a.header:
+        k, sep, v = h.partition(":")
+        if not sep:
+            print(f"sluice: --header must look like 'Name: value', got {h!r}", file=sys.stderr)
+            return 2
+        headers[k.strip()] = v.strip()
+    store = _store()
+    store.gc(policy.flow.session_ttl * 2, recordings_older_than=policy.record.retain_days * 86400)
+    name = a.name or (urlsplit(a.upstream).hostname or "remote")
+    session = os.environ.get("SLUICE_SESSION") or f"http-{name}"
+    proxy = HttpProxy(a.upstream, policy, store, name=name, session=session, path=a.path,
+                      allow_origins=tuple(a.allow_origin), extra_headers=headers)
+    serve(proxy, a.host, a.port)
+    return 0
+
 
 def cmd_run(a: argparse.Namespace) -> int:
     from sluice.engine import Engine
@@ -370,6 +398,22 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--log-level", default="warning", choices=["debug", "info", "warning", "error"])
     r.add_argument("cmd", nargs=argparse.REMAINDER, help="-- server command and arguments")
     r.set_defaults(fn=cmd_run)
+
+    sv = sub.add_parser("serve", help="protect a remote (Streamable HTTP) MCP server via a local proxy URL")
+    sv.add_argument("--upstream", required=True, help="the remote MCP endpoint, e.g. https://mcp.example.com/mcp")
+    sv.add_argument("--name", help="server name used in policies and logs (default: upstream host)")
+    sv.add_argument("--policy")
+    sv.add_argument("--host", default="127.0.0.1", help="listen address (default: 127.0.0.1)")
+    sv.add_argument("--port", type=int, default=8931)
+    sv.add_argument("--path", default="/mcp", help="local endpoint path (default: /mcp)")
+    sv.add_argument("--header", action="append", default=[],
+                    help="extra header for the upstream, e.g. 'Authorization: Bearer ...' (repeatable)")
+    sv.add_argument("--allow-origin", action="append", default=[],
+                    help="browser Origin to accept besides localhost (repeatable)")
+    sv.add_argument("--monitor", action="store_true")
+    sv.add_argument("--quiet", action="store_true")
+    sv.add_argument("--log-level", default="warning", choices=["debug", "info", "warning", "error"])
+    sv.set_defaults(fn=cmd_serve)
 
     s = sub.add_parser("scan", help="scan MCP configs for poisoned tools and toxic capability combinations")
     s.add_argument("config", nargs="*", help="config files (default: auto-detect Claude Desktop/Cursor/VS Code)")

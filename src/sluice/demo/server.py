@@ -95,42 +95,48 @@ def weather_profile() -> tuple[list[dict[str, Any]], dict[str, ToolFn]]:
 PROFILES = {"notes": notes_profile, "web": web_profile, "weather": weather_profile}
 
 
-def serve(profile: str) -> None:
+def make_handler(profile: str) -> Callable[[dict[str, Any]], dict[str, Any] | None]:
+    """JSON-RPC message -> response (None for notifications). Shared by the stdio and HTTP demos."""
     tools, handlers = PROFILES[profile]()
+
+    def handle(msg: dict[str, Any]) -> dict[str, Any] | None:
+        if "id" not in msg:
+            return None
+        method, mid = msg.get("method"), msg["id"]
+        params = msg.get("params") or {}
+        if method == "initialize":
+            return {"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": params.get("protocolVersion", "2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": f"demo-{profile}", "version": "1.0"}}}
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": mid, "result": {}}
+        if method == "tools/list":
+            return {"jsonrpc": "2.0", "id": mid, "result": {"tools": tools}}
+        if method == "tools/call":
+            fn = handlers.get(params.get("name"))
+            if fn is None:
+                return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
+            text = fn(params.get("arguments") or {})
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": {"content": [{"type": "text", "text": text}], "isError": False}}
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"unknown method {method}"}}
+
+    return handle
+
+
+def serve(profile: str) -> None:
+    handle = make_handler(profile)
     out = sys.stdout.buffer
-
-    def send(msg: dict[str, Any]) -> None:
-        out.write(json.dumps(msg).encode() + b"\n")
-        out.flush()
-
     for line in iter(sys.stdin.buffer.readline, b""):
         try:
             msg = json.loads(line)
         except ValueError:
             continue
-        if "id" not in msg:
-            continue
-        method, mid = msg.get("method"), msg["id"]
-        params = msg.get("params") or {}
-        if method == "initialize":
-            send({"jsonrpc": "2.0", "id": mid, "result": {
-                "protocolVersion": params.get("protocolVersion", "2025-06-18"),
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": f"demo-{profile}", "version": "1.0"}}})
-        elif method == "ping":
-            send({"jsonrpc": "2.0", "id": mid, "result": {}})
-        elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": tools}})
-        elif method == "tools/call":
-            fn = handlers.get(params.get("name"))
-            if fn is None:
-                send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}})
-            else:
-                text = fn(params.get("arguments") or {})
-                send({"jsonrpc": "2.0", "id": mid,
-                      "result": {"content": [{"type": "text", "text": text}], "isError": False}})
-        else:
-            send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"unknown method {method}"}})
+        reply = handle(msg) if isinstance(msg, dict) else None
+        if reply is not None:
+            out.write(json.dumps(reply).encode() + b"\n")
+            out.flush()
 
 
 if __name__ == "__main__":
