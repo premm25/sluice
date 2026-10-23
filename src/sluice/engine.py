@@ -33,6 +33,7 @@ from sluice.detectors import (
     Finding,
     at_least,
     find_hidden,
+    foreign_tool_names,
     redact_secrets,
     scan_injection,
     scan_tool,
@@ -437,6 +438,9 @@ class Engine:
             return msg
         enforce = self.policy.enforce
         names = [str(t.get("name", "")) for t in tools if isinstance(t, dict)]
+        # Shadowing targets: tools of other servers seen by any proxy sharing this store.
+        # A name this server also offers is its own tool, so mentioning it is fine.
+        foreign = foreign_tool_names(self.pins.other_tool_names(self.server), names)
         if self.record:
             digest = hashlib.sha256(json.dumps(tools, sort_keys=True, default=str).encode()).hexdigest()
             if digest != self._listed:  # don't re-record an unchanged list on every poll
@@ -458,7 +462,7 @@ class Engine:
                     continue
 
             if self.policy.detect.tool_poisoning != "off":
-                info.findings = scan_tool(tool, names)
+                info.findings = scan_tool(tool, foreign)
                 if info.findings:
                     severe = at_least(info.findings, "high")
                     quarantine = severe and self.policy.detect.tool_poisoning == "block"

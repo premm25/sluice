@@ -81,6 +81,10 @@ class PinStore:
             return self.store.execute("DELETE FROM pins WHERE server=?", (server,)).rowcount
         return self.store.execute("DELETE FROM pins").rowcount
 
+    def other_tool_names(self, server: str) -> set[str]:
+        """Names of tools pinned for every *other* server (the shadowing targets)."""
+        return {r["tool"] for r in self.store.query("SELECT DISTINCT tool FROM pins WHERE server != ?", (server,))}
+
     def list(self, server: str | None = None) -> list[dict[str, Any]]:
         sql = "SELECT server, tool, hash, status, first_seen, updated, pending_hash FROM pins"
         params: list[Any] = []

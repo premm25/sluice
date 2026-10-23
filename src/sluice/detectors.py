@@ -136,7 +136,7 @@ INJECTION_PATTERNS: list[tuple[str, str, re.Pattern[str], str]] = [
         r"[^.\n]{0,25}?\b(instructions?|prompts?|rules|directions|guidelines|guardrails|polic(y|ies))\b", _I),
      "attempts to override the agent's instructions"),
     ("fake_system_tag", "high", re.compile(
-        r"</?\s*(system|important|instructions?|admin|assistant|developer)\s*>|\[/?(system|INST)\]|<\|im_(start|end)\|>", _I),
+        r"</?\s*(system|important|instructions?|admin|assistant|developer|hidden|secret)\s*>|\[/?(system|INST)\]|<\|im_(start|end)\|>", _I),
      "contains fake system/priority markup"),
     ("conceal_from_user", "high", re.compile(
         r"\b(do not|don't|dont|never|without)\b[^.\n]{0,30}?\b(tell|telling|inform|informing|mention|mentioning|reveal|revealing|show|showing|alert|alerting|notify|notifying|asking)\b"
@@ -206,6 +206,18 @@ def tool_text(tool: dict[str, Any]) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def foreign_tool_names(others: Iterable[str], own: Iterable[str]) -> list[str]:
+    """Other servers' tool names, minus any this server also offers itself -- exactly or
+    namespaced (``aws___search_documentation`` may call itself ``search_documentation``)."""
+    own_l = {o.lower() for o in own}
+    out = []
+    for name in set(others):
+        n = name.lower()
+        if not any(o == n or re.search(rf"[^a-z0-9]{re.escape(n)}$", o) for o in own_l):
+            out.append(name)
+    return sorted(out)
+
+
 def scan_tool(tool: dict[str, Any], other_tool_names: Iterable[str] = ()) -> list[Finding]:
     """Detect tool poisoning: injected instructions hidden in a tool's metadata."""
     text = tool_text(tool)
@@ -230,11 +242,14 @@ def scan_tool(tool: dict[str, Any], other_tool_names: Iterable[str] = ()) -> lis
         findings.append(Finding("encoded_blob", "medium", "metadata contains a long base64-like blob",
                                 m.group()[:60] + "…"))
 
-    # Cross-tool shadowing: a tool that talks about *another* tool is trying
-    # to change how the agent uses that other tool.
+    # Cross-tool shadowing: a tool that talks about another *server's* tool is
+    # trying to change how the agent uses it. Callers pass only other servers'
+    # tool names -- sibling references ("search first, then fetch") are normal
+    # workflow guidance, and a server gains nothing by shadowing its own tools.
+    # Plain words ("search", "fetch") are skipped: they cannot be pinned to one tool.
     lowered = text.lower()
     for other in other_tool_names:
-        if not other or other == name or len(other) < 4:
+        if not other or other == name or len(other) < 4 or other.isalpha():
             continue
         if re.search(rf"(?<![\w-]){re.escape(other.lower())}(?![\w-])", lowered):
             findings.append(Finding(

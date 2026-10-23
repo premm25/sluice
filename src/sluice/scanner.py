@@ -23,7 +23,7 @@ from typing import Any
 
 from sluice import __version__
 from sluice.client import StdioClient
-from sluice.detectors import Finding, max_severity, scan_tool, severity_rank
+from sluice.detectors import Finding, foreign_tool_names, max_severity, scan_tool, severity_rank
 from sluice.flow import PRIVATE, SINK, UNTRUSTED
 from sluice.policy import Policy
 
@@ -78,6 +78,7 @@ class ServerReport:
     tools: list[ToolReport] = field(default_factory=list)
     error: str | None = None
     skipped: str | None = None
+    definitions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -113,15 +114,20 @@ def scan_server(name: str, spec: dict[str, Any], policy: Policy, timeout: float 
     except Exception as e:  # report and keep scanning other servers
         report.error = str(e).strip() or type(e).__name__
         return report
-    names = [str(t.get("name", "")) for t in tools]
-    for tool in tools:
-        tname = str(tool.get("name", ""))
-        report.tools.append(ToolReport(tname, policy.labels_for(name, tname, tool), scan_tool(tool, names)))
+    report.definitions = tools
     return report
 
 
 def scan(servers: dict[str, dict[str, Any]], policy: Policy, timeout: float = 20) -> ScanReport:
-    return ScanReport([scan_server(n, s, policy, timeout) for n, s in servers.items()])
+    reports = [scan_server(n, s, policy, timeout) for n, s in servers.items()]
+    # Shadowing is judged across servers: a tool mentioning a *sibling* tool is normal.
+    names = {r.name: {str(t.get("name", "")) for t in r.definitions} for r in reports}
+    for r in reports:
+        foreign = foreign_tool_names(set().union(*(v for k, v in names.items() if k != r.name)), names[r.name])
+        for tool in r.definitions:
+            tname = str(tool.get("name", ""))
+            r.tools.append(ToolReport(tname, policy.labels_for(r.name, tname, tool), scan_tool(tool, foreign)))
+    return ScanReport(reports)
 
 
 # --------------------------------------------------------------------------
