@@ -50,7 +50,7 @@ It sees every JSON-RPC message and enforces a policy:
 |---|---|
 | **Exfiltration blocking** | Output of `private` tools is fingerprinted with **winnowing** (the algorithm behind the MOSS plagiarism detector). Calls to `sink` tools are checked for those fingerprints after peeling **URL / base64 / hex** encodings, nested up to 3 layers deep. Only hashes are stored, never your data. |
 | **Lethal-trifecta detection** | Taint labels (`private`, `untrusted`, `sink`) are tracked per *client session* **across servers**, so private data from server A plus an injection from server B plus a sink on server C is caught. |
-| **Tool-poisoning quarantine** | Tool names, descriptions and JSON-schema text are scanned for injected instructions, fake `<IMPORTANT>` tags, references to `~/.ssh` & co., and **cross-tool shadowing**. Poisoned tools are removed from `tools/list` before the model sees them. |
+| **Tool-poisoning quarantine** | Tool names, descriptions and JSON-schema text are scanned for injected instructions, fake `<IMPORTANT>` tags, references to `~/.ssh` & co., and **cross-server shadowing** (a tool trying to change how another server's tool is used). Poisoned tools are removed from `tools/list` before the model sees them. |
 | **Rug-pull protection** | Tool definitions are pinned (SHA-256, trust on first use). A changed tool is quarantined until you run `sluice pins approve`. |
 | **ASCII-smuggling defense** | Invisible Unicode (zero-width chars, bidi overrides, **Unicode tag characters**, variation-selector byte smuggling) is stripped, and the hidden payload is **decoded and shown to you**. |
 | **Secret redaction** | AWS / GitHub / Anthropic / OpenAI / Slack / Stripe / Google keys, JWTs, private keys and DB URLs are redacted from tool results. |
@@ -309,6 +309,24 @@ The test config was wrapped with `sluice wrap` and used no session environment v
 11:07:48  BLOCK   fetch/fetch call arguments contain 22 content fingerprint(s) from private source
                   notes/read_note (hidden via base64 encoding)   # never reached the network
 ```
+
+**False-positive check on public servers.** Tool lists from 14 public servers were passed through the real
+proxies (`sluice run` for stdio, `sluice serve` for HTTP). The servers were git, fetch, time, DuckDuckGo,
+MarkItDown, AWS Docs, DeepWiki, Context7, Microsoft Learn, AWS Knowledge, Cloudflare Docs, Hugging Face,
+GitMCP and Astro Docs. Three more were attempted but did not run: arXiv and Calculator crashed on mcp 2.x,
+and Semgrep needs a login.
+
+The first run found a real bug: the shadowing check hid legitimate tools that refer to their own siblings,
+for example "search, then fetch". Shadowing is now judged only against *other servers'* tools, and
+**none of the 48 tools on the 14 servers is quarantined**.
+
+**Known-malicious servers.** Sluice was also run against the tool definitions of
+[Invariant Labs' injection experiments](https://github.com/invariantlabs-ai/mcp-injection-experiments) and
+[Damn Vulnerable MCP Server](https://github.com/harishsg993010/damn-vulnerable-MCP-server):
+
+- **Quarantined:** direct poisoning, cross-server shadowing, and `<HIDDEN>`/`<IMPORTANT>` instructions.
+- **Rug pull:** the WhatsApp takeover's description swap is blocked on the second launch.
+- **Not tested yet:** DVMCP's runtime challenges, such as shell execution and leaked tokens, need a live run.
 
 ## Threat model and limitations
 
