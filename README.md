@@ -6,6 +6,7 @@ data exfiltration by tracking *where data came from* and *where it's going*, eve
 agent base64-encodes it first.
 
 [![CI](https://github.com/premm25/sluice/actions/workflows/ci.yml/badge.svg)](https://github.com/premm25/sluice/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/sluice-mcp)](https://pypi.org/project/sluice-mcp/)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
 ![Dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -61,8 +62,8 @@ It sees every JSON-RPC message and enforces a policy:
 ## Quick start
 
 ```bash
-pip install git+https://github.com/premm25/sluice   # Python 3.11+, no dependencies
-sluice demo                                         # watch an attack get stopped, end to end
+pip install sluice-mcp      # Python 3.11+, no dependencies
+sluice demo                 # watch an attack get stopped, end to end
 ```
 
 **Audit your current setup.** This auto-detects Claude Desktop, Cursor and VS Code configs:
@@ -276,7 +277,7 @@ sent out in many small pieces, each too small to recognise on its own.
 ### CI usage
 
 ```yaml
-- run: pip install git+https://github.com/premm25/sluice
+- run: pip install sluice-mcp
 - run: sluice scan .vscode/mcp.json --format sarif -o sluice.sarif --fail-on high
 - uses: github/codeql-action/upload-sarif@v3
   with: { sarif_file: sluice.sarif }
