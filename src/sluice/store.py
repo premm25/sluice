@@ -78,9 +78,22 @@ class Store:
         self.conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         with self._lock:
-            self.conn.execute("PRAGMA journal_mode=WAL")
+            # Several proxies of one client start at the same moment. A read that
+            # upgrades to a write fails instantly when it races another writer
+            # (SQLite won't wait, to avoid deadlock), so take the write lock up
+            # front with BEGIN IMMEDIATE and retry the one-off WAL switch.
+            for attempt in range(100):
+                try:
+                    self.conn.execute("PRAGMA journal_mode=WAL")
+                    self.conn.executescript(f"BEGIN IMMEDIATE;{SCHEMA}COMMIT;")
+                    break
+                except sqlite3.OperationalError as e:
+                    if self.conn.in_transaction:
+                        self.conn.execute("ROLLBACK")
+                    if "locked" not in str(e) or attempt == 99:
+                        raise
+                    time.sleep(0.05)
             self.conn.execute("PRAGMA synchronous=NORMAL")
-            self.conn.executescript(SCHEMA)
 
     def close(self) -> None:
         with self._lock:

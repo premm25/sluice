@@ -94,3 +94,23 @@ def test_pins_are_scoped_per_server(store):
     pins.check("a", TOOL)
     assert pins.check("b", {**TOOL, "description": "different"}).status == "new"
     assert pins.reset("a") == 1
+
+
+def test_many_processes_can_open_a_fresh_store_at_once(tmp_path):
+    # All proxies of one MCP client start together and share one new database.
+    import subprocess
+    import sys
+    import time
+    db, go = tmp_path / "state.db", tmp_path / "go"
+    code = ("import os, sys, time\n"
+            "from sluice.store import Store\n"
+            "while not os.path.exists(sys.argv[2]): time.sleep(0.001)\n"
+            "s = Store(sys.argv[1])\n"
+            "s.execute('INSERT INTO taint VALUES (?,?,?,?,?)', ('s', 'private', 'srv', 't', 0))\n")
+    procs = [subprocess.Popen([sys.executable, "-c", code, str(db), str(go)], stderr=subprocess.PIPE)
+             for _ in range(16)]
+    time.sleep(1.5)  # let every process reach the starting line
+    go.touch()
+    errors = [p.communicate(timeout=60)[1].decode() for p in procs]
+    assert all(p.returncode == 0 for p in procs), next(e for e in errors if e)
+    assert len(Store(db).query("SELECT * FROM taint")) == 16
