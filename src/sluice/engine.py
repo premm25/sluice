@@ -44,6 +44,7 @@ from sluice.pinning import PinStore
 from sluice.policy import Policy
 from sluice.ratelimit import RateLimiter
 from sluice.recording import pack_fingerprints, redact_tree
+from sluice.sentinel import SentinelEnforcer, SentinelShadow
 from sluice.store import Store, default_session
 
 log = logging.getLogger("sluice")
@@ -88,6 +89,14 @@ def blocked_result(msg_id: Any, tool: str, reasons: list[str]) -> JSON:
             "result": {"content": [{"type": "text", "text": text}], "isError": True}}
 
 
+def held_result(msg_id: Any, tool: str, review_id: str) -> JSON:
+    text = (f"[sluice] The call to '{tool}' needs a person's approval before it can run (Action Sentinel review "
+            f"{review_id}). It has NOT run. Tell the user it is waiting for their approval. Once they say they "
+            "have approved it, call the tool again with exactly the same arguments and it will run.")
+    return {"jsonrpc": "2.0", "id": msg_id,
+            "result": {"content": [{"type": "text", "text": text}], "isError": True}}
+
+
 def _map_texts(result: JSON, fn: Callable[[str], str]) -> JSON:
     """Apply ``fn`` to every text the model will read in a tool/resource result."""
     def walk(node: Any) -> Any:
@@ -128,7 +137,7 @@ def _collect_texts(result: JSON) -> str:
 class Engine:
     def __init__(self, policy: Policy, store: Store, server: str = "default",
                  session: str | None = None, *, clock: Callable[[], float] = time.time,
-                 record: bool | None = None):
+                 record: bool | None = None, sentinel: SentinelShadow | None = None):
         self.policy = policy
         self.store = store
         self.server = server
@@ -143,16 +152,19 @@ class Engine:
         self.limiter = RateLimiter()
         self.tools: dict[str, ToolInfo] = {}
         self._pending: dict[str, tuple[str, str | None, int | None]] = {}
+        self._executions: dict[str, str] = {}  # request id -> Sentinel execution to finish (enforce mode)
         self._listed: str | None = None
         self._lock = threading.RLock()
+        self.sentinel = sentinel  # Action Sentinel: shadow verdicts, or (SentinelEnforcer) a second gate
 
     # ------------------------------------------------------------------ API
 
     def from_client(self, msg: Any) -> Verdict:
-        with self._lock:
-            if isinstance(msg, list):
-                return self._batch(msg, self._client_one)
-            return self._client_one(msg)
+        # Not one lock for the whole message: in enforce mode a call waits for Sentinel, and other
+        # requests and server results must keep flowing meanwhile. Each step locks what it touches.
+        if isinstance(msg, list):
+            return self._batch(msg, self._client_one)
+        return self._client_one(msg)
 
     def from_server(self, msg: Any) -> Verdict:
         with self._lock:
@@ -186,7 +198,8 @@ class Engine:
             return Verdict([msg])  # notification or a response to a server->client request
         if method == "tools/call":
             return self._on_call(msg)
-        self._pending[_key(msg["id"])] = (method, None, None)
+        with self._lock:
+            self._pending[_key(msg["id"])] = (method, None, None)
         return Verdict([msg])
 
     def _server_one(self, msg: Any) -> Verdict:
@@ -195,6 +208,10 @@ class Engine:
                 self.audit.log("tools_changed_notice", decision="info")
             return Verdict([msg])
         entry = self._pending.pop(_key(msg["id"]), None)
+        execution = self._executions.pop(_key(msg["id"]), None)
+        if execution is not None and isinstance(self.sentinel, SentinelEnforcer):
+            ok = "result" in msg and not (isinstance(msg["result"], dict) and msg["result"].get("isError"))
+            self.sentinel.finish(self.audit, entry[1] if entry else None, execution, ok)
         if entry is None or "result" not in msg:
             return Verdict([msg])
         method, tool, record_id = entry
@@ -219,9 +236,23 @@ class Engine:
         name = str(params.get("name", ""))
         args = params.get("arguments") or {}
         d = self.decide_call(name, args)
+        execution = None
+        if isinstance(self.sentinel, SentinelEnforcer) and not d.blocked:
+            # Sentinel decides too. No engine lock is held while it answers.
+            g = self.sentinel.gate(self.audit, self.server, self.session, name, args, d.decision, d.codes)
+            if g.held:
+                return Verdict(reply=[held_result(msg.get("id"), name, g.message)])
+            if not g.allowed:
+                return Verdict(reply=[blocked_result(msg.get("id"), name, [g.message])])
+            execution = g.execution_id
+        elif self.sentinel is not None:  # shadow mode, or a call Sluice blocked: record Sentinel's view
+            self.sentinel.submit(self.audit, self.server, self.session, name, args, d.decision, d.codes)
         if d.blocked:
             return Verdict(reply=[blocked_result(msg.get("id"), name, d.reasons)])
-        self._pending[_key(msg["id"])] = ("tools/call", name, d.record_id)
+        with self._lock:
+            self._pending[_key(msg["id"])] = ("tools/call", name, d.record_id)
+            if execution is not None:
+                self._executions[_key(msg["id"])] = execution
         return Verdict([msg])
 
     def _leak_found(self, leak: LeakReport, name: str, detail: dict[str, Any]) -> bool:

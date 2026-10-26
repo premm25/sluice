@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import functools
 import json
 import logging
 import re
@@ -35,11 +36,37 @@ def _store():
     return Store()
 
 
+def _sentinel(policy):
+    """The Action Sentinel worker (shadow or enforce), when the policy has a [sentinel] url."""
+    if not policy.sentinel.enabled:
+        return None
+    import dataclasses
+
+    from sluice import sentinel
+    log = logging.getLogger("sluice")
+    cfg = policy.sentinel
+    if cfg.mode == "enforce" and policy.mode == "monitor":
+        log.warning("[sentinel] monitor mode: Sentinel's verdicts are recorded but not enforced")
+        cfg = dataclasses.replace(cfg, mode="shadow")
+    if cfg.api_key() is None:
+        log.warning("[sentinel] %s is not set: %s", cfg.api_key_env,
+                    "every call will be blocked" if cfg.mode == "enforce" and cfg.on_error == "block"
+                    else "Sentinel's verdicts will be recorded as unavailable")
+    return sentinel.make(cfg)
+
+
+def _sentinel_note(worker) -> str:
+    if worker is None:
+        return ""
+    return f", Sentinel {'enforcing' if worker.enforcing else 'shadow'} at {worker.config.url}"
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_serve(a: argparse.Namespace) -> int:
     import os
 
+    from sluice.engine import Engine
     from sluice.http_proxy import HttpProxy, serve
 
     level = logging.ERROR if a.quiet else getattr(logging, a.log_level.upper())
@@ -58,8 +85,10 @@ def cmd_serve(a: argparse.Namespace) -> int:
     store.gc(policy.flow.session_ttl * 2, recordings_older_than=policy.record.retain_days * 86400)
     name = a.name or (urlsplit(a.upstream).hostname or "remote")
     session = os.environ.get("SLUICE_SESSION") or f"http-{name}"
+    shadow = _sentinel(policy)
     proxy = HttpProxy(a.upstream, policy, store, name=name, session=session, path=a.path,
-                      allow_origins=tuple(a.allow_origin), extra_headers=headers)
+                      allow_origins=tuple(a.allow_origin), extra_headers=headers,
+                      engine_factory=functools.partial(Engine, sentinel=shadow))
     serve(proxy, a.host, a.port)
     return 0
 
@@ -80,14 +109,19 @@ def cmd_run(a: argparse.Namespace) -> int:
     store = _store()
     store.gc(policy.flow.session_ttl * 2, recordings_older_than=policy.record.retain_days * 86400)
     name = a.name or Path(cmd[-1]).stem or "server"
-    engine = Engine(policy, store, server=name)
-    logging.getLogger("sluice").info("protecting '%s' (%s mode, policy %s, session %s)",
-                                     name, policy.mode, policy.source, engine.session)
+    shadow = _sentinel(policy)
+    engine = Engine(policy, store, server=name, sentinel=shadow)
+    logging.getLogger("sluice").info("protecting '%s' (%s mode, policy %s, session %s%s)",
+                                     name, policy.mode, policy.source, engine.session,
+                                     _sentinel_note(shadow))
     try:
         return run_proxy(cmd, engine)
     except FileNotFoundError as e:
         print(f"sluice: cannot start server: {e}", file=sys.stderr)
         return 127
+    finally:
+        if shadow is not None:
+            shadow.flush(timeout=5)  # record the last verdicts before exiting
 
 
 def cmd_scan(a: argparse.Namespace) -> int:
@@ -375,6 +409,63 @@ def cmd_record(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sentinel(a: argparse.Namespace) -> int:
+    from sluice import sentinel
+    from sluice.term import style
+
+    policy = _load_policy(a.policy)
+    if a.sentinel_cmd == "export":
+        rows = sentinel.export(_store(), since=time.time() - a.days * 86400 if a.days else 0.0)
+        text = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+        if not a.out:
+            sys.stdout.write(text)
+        else:
+            Path(a.out).write_text(text, encoding="utf-8")
+            print(f"wrote {len(rows)} call(s) to {a.out}; set each row's \"label\" to safe, needs_review or unsafe, "
+                  "then: action-sentinel vega dataset --from " + a.out, file=sys.stderr)
+        return 0
+    if a.sentinel_cmd == "report":
+        r = sentinel.report(_store())
+        if a.json:
+            print(json.dumps(r, indent=2))
+            return 0
+        if not r["recorded"]:
+            print("no Sentinel verdicts recorded yet (add a [sentinel] section to the policy)")
+            return 0
+        agreement = "n/a" if r["agreement"] is None else f"{100 * r['agreement']:.0f}%"
+        print(f"{r['assessed']} call(s) assessed by Sentinel, {r['unavailable']} unavailable; "
+              f"agreement on run/stop: {agreement}")
+        if r["enforce"]:
+            e = r["enforce"]
+            print(f"enforced: {e['ran']} ran, {e['held']} waiting for review, {e['stopped']} stopped by Sentinel")
+        for k, n in r["pairs"].items():
+            print(f"  {n:6d}  {k}")
+        for d in r["disagreements"]:
+            print(f"  {style('differ', 'yellow')} {d['server']}/{d['tool']}: sluice {d['sluice']}, "
+                  f"Sentinel {d['sentinel']} {', '.join(d['sentinel_codes'])}")
+        return 0
+    cfg = policy.sentinel
+    if not cfg.enabled:
+        print(f"sluice: {policy.source} has no [sentinel] url", file=sys.stderr)
+        return 2
+    client = sentinel.SentinelClient(cfg)
+    try:
+        h = client.health()
+    except Exception as e:
+        print(style(f"cannot reach Sentinel at {cfg.url}: {e}", "red"))
+        return 1
+    print(f"Sentinel {h.get('version', '?')} at {cfg.url} ({h.get('environment', '?')}, policy "
+          f"{h.get('policy_version', '?')})")
+    probe = sentinel.proposal("sluice-check", "list_tools", {}, session="sluice-check", agent_id=cfg.agent_id,
+                              sluice_decision="allow", sluice_codes=[])
+    v = client.assess(probe)
+    if v.outcome is None:
+        print(style(f"assessment failed: {v.error}", "red"))
+        return 1
+    print(style(f"ok: a probe call was assessed as {v.outcome} in {v.latency_ms:.0f} ms", "green"))
+    return 0
+
+
 def cmd_demo(a: argparse.Namespace) -> int:
     from sluice.demo.run import main as demo_main
     return demo_main(pace=0.0 if a.fast else 0.4)
@@ -509,6 +600,17 @@ def build_parser() -> argparse.ArgumentParser:
     sc = ses.add_parser("clear")
     sc.add_argument("session", nargs="?")
     se.set_defaults(fn=cmd_session)
+
+    sn = sub.add_parser("sentinel", help="Action Sentinel: check the connection, compare decisions, export calls")
+    sns = sn.add_subparsers(dest="sentinel_cmd", required=True)
+    sns.add_parser("check", help="reach Sentinel and assess a probe call")
+    snr = sns.add_parser("report", help="how often Sluice and Sentinel agree")
+    snr.add_argument("--json", action="store_true")
+    sne = sns.add_parser("export", help="write the calls Sentinel saw as JSONL, to label (for VegaML)")
+    sne.add_argument("--out", help="file to write (default: stdout)")
+    sne.add_argument("--days", type=float, help="only the last N days")
+    sn.add_argument("--policy", help="policy TOML (default: $SLUICE_POLICY or ~/.sluice/policy.toml)")
+    sn.set_defaults(fn=cmd_sentinel)
 
     d = sub.add_parser("demo", help="watch sluice stop a prompt-injection exfiltration attack")
     d.add_argument("--fast", action="store_true")

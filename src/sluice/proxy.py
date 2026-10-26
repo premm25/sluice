@@ -101,9 +101,17 @@ def run_proxy(cmd: list[str], engine: Engine, stdin: BinaryIO | None = None,
     server_in = _Writer(proc.stdin)
     server_out = proc.stdout
 
+    # In Sentinel enforce mode a tools/call waits for Sentinel's answer (and maybe a review), so each call is
+    # checked on its own thread; everything else keeps its order on this one.
+    concurrent_calls = getattr(engine.sentinel, "enforcing", False)
+
     def pump_client() -> None:
         try:
             for line in iter(client_in.readline, b""):
+                if concurrent_calls and b'"tools/call"' in line:
+                    threading.Thread(target=_process_line, name="sluice-call", daemon=True,
+                                     args=(line, engine.from_client, server_in, client_out, True)).start()
+                    continue
                 _process_line(line, engine.from_client, server_in, client_out, from_client=True)
         finally:
             server_in.close()  # client went away: let the server shut down...
