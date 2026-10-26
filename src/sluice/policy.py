@@ -18,6 +18,7 @@ from typing import Any
 from sluice.flow import LABELS
 from sluice.labels import auto_labels
 from sluice.ratelimit import RateLimiter, parse_rate
+from sluice.sentinel import SentinelConfig
 
 
 class PolicyError(ValueError):
@@ -123,6 +124,7 @@ class Policy:
     pinning: PinningConfig = field(default_factory=PinningConfig)
     flow: FlowConfig = field(default_factory=FlowConfig)
     record: RecordConfig = field(default_factory=RecordConfig)
+    sentinel: SentinelConfig = field(default_factory=SentinelConfig)
     rules: list[Rule] = field(default_factory=list)
     tool_labels: list[ToolLabel] = field(default_factory=list)
     source: str = "<defaults>"
@@ -269,7 +271,8 @@ def _regexes(where: str, values: Any) -> list[re.Pattern[str]]:
 
 
 def from_dict(data: dict[str, Any], source: str = "<dict>") -> Policy:
-    _check_keys("policy", data, {"mode", "default_action", "detect", "pinning", "flow", "record", "tools", "rules"})
+    _check_keys("policy", data, {"mode", "default_action", "detect", "pinning", "flow", "record", "sentinel",
+                                 "tools", "rules"})
     p = Policy(source=source)
     p.mode = _choice("policy", "mode", data.get("mode", p.mode), ("enforce", "monitor"))
     p.default_action = _choice("policy", "default_action", data.get("default_action", p.default_action),
@@ -305,6 +308,15 @@ def from_dict(data: dict[str, Any], source: str = "<dict>") -> Policy:
     p.record = RecordConfig(**rec)
     if p.record.retain_days <= 0:
         raise PolicyError("[record] retain_days must be > 0")
+
+    sen = data.get("sentinel", {})
+    _check_keys("sentinel", sen, set(SentinelConfig.__dataclass_fields__))
+    p.sentinel = SentinelConfig(**sen)
+    _choice("sentinel", "mode", p.sentinel.mode, ("shadow",))
+    if p.sentinel.url and not p.sentinel.url.startswith(("http://", "https://")):
+        raise PolicyError("[sentinel] url must start with http:// or https://")
+    if p.sentinel.timeout <= 0 or p.sentinel.max_pending < 1:
+        raise PolicyError("[sentinel] timeout must be > 0 and max_pending >= 1")
 
     for i, entry in enumerate(data.get("tools", [])):
         where = f"tools[{i}]"
@@ -404,6 +416,14 @@ allow_flows = [
 # results -- never result text -- so `sluice learn` and `sluice replay` can work.
 enabled = true
 retain_days = 14
+
+# [sentinel]
+# Optional: also ask an Action Sentinel service (github.com/premm25/action-sentinel) what it would decide
+# about each tool call. Shadow mode only records its verdict next to Sluice's; it never changes a decision.
+# Compare them with `sluice sentinel report`.
+# url = "http://127.0.0.1:8000"
+# api_key_env = "SENTINEL_API_KEY"   # the key is read from this environment variable, never from this file
+# agent_id = "mcp-proxy"
 
 # ---- Capability labels -------------------------------------------------------
 # private:   returns data that must not leave (files, mail, databases)

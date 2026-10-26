@@ -44,6 +44,7 @@ from sluice.pinning import PinStore
 from sluice.policy import Policy
 from sluice.ratelimit import RateLimiter
 from sluice.recording import pack_fingerprints, redact_tree
+from sluice.sentinel import SentinelShadow
 from sluice.store import Store, default_session
 
 log = logging.getLogger("sluice")
@@ -128,7 +129,7 @@ def _collect_texts(result: JSON) -> str:
 class Engine:
     def __init__(self, policy: Policy, store: Store, server: str = "default",
                  session: str | None = None, *, clock: Callable[[], float] = time.time,
-                 record: bool | None = None):
+                 record: bool | None = None, sentinel: SentinelShadow | None = None):
         self.policy = policy
         self.store = store
         self.server = server
@@ -145,6 +146,7 @@ class Engine:
         self._pending: dict[str, tuple[str, str | None, int | None]] = {}
         self._listed: str | None = None
         self._lock = threading.RLock()
+        self.sentinel = sentinel  # shadow verdicts from Action Sentinel; never changes a decision
 
     # ------------------------------------------------------------------ API
 
@@ -219,6 +221,8 @@ class Engine:
         name = str(params.get("name", ""))
         args = params.get("arguments") or {}
         d = self.decide_call(name, args)
+        if self.sentinel is not None:
+            self.sentinel.submit(self.audit, self.server, self.session, name, args, d.decision, d.codes)
         if d.blocked:
             return Verdict(reply=[blocked_result(msg.get("id"), name, d.reasons)])
         self._pending[_key(msg["id"])] = ("tools/call", name, d.record_id)

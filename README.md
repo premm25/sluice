@@ -129,6 +129,31 @@ Not ready to enforce yet? Add `--monitor` (or `mode = "monitor"`) to log what *w
 blocked without changing anything. Then review with `sluice audit tail` or
 `sluice audit report -o report.html`.
 
+## With Action Sentinel (optional, shadow mode)
+
+Sluice tracks *where data flows*. [Action Sentinel](https://github.com/premm25/action-sentinel) judges
+*what an action does*: rules for forbidden actions and dangerous arguments, an optional model risk score
+(VegaML), and human review. Sluice can ask a Sentinel service about every tool call and record its verdict
+next to Sluice's own decision. Shadow mode never changes what Sluice does, and the proxy never waits for
+Sentinel: calls are sent from a background thread.
+
+```toml
+[sentinel]
+url = "http://127.0.0.1:8000"       # action-sentinel --config config/sentinel-mcp.yaml serve
+api_key_env = "SENTINEL_API_KEY"    # the key is read from this environment variable, never from the policy
+```
+
+```bash
+sluice sentinel check     # reach Sentinel and assess a probe call
+sluice sentinel report    # how often Sluice and Sentinel agree, and where they differ
+```
+
+In a live run they each caught something the other missed: Sentinel blocked a `fetch` that carried an
+`api_key` argument (Sluice only warned), and Sluice blocked a `fetch` that carried a private note to an
+attacker's URL (Sentinel approved it, because it can't see where data came from). Tool arguments are sent to
+Sentinel as they are, so point `url` only at a Sentinel you run. Details:
+[action-sentinel/docs/MCP.md](https://github.com/premm25/action-sentinel/blob/main/docs/MCP.md).
+
 ## How it works
 
 ```mermaid
