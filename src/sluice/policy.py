@@ -312,7 +312,8 @@ def from_dict(data: dict[str, Any], source: str = "<dict>") -> Policy:
     sen = data.get("sentinel", {})
     _check_keys("sentinel", sen, set(SentinelConfig.__dataclass_fields__))
     p.sentinel = SentinelConfig(**sen)
-    _choice("sentinel", "mode", p.sentinel.mode, ("shadow",))
+    _choice("sentinel", "mode", p.sentinel.mode, ("shadow", "enforce"))
+    _choice("sentinel", "on_error", p.sentinel.on_error, ("block", "allow"))
     if p.sentinel.url and not p.sentinel.url.startswith(("http://", "https://")):
         raise PolicyError("[sentinel] url must start with http:// or https://")
     if p.sentinel.timeout <= 0 or p.sentinel.max_pending < 1:
@@ -418,12 +419,14 @@ enabled = true
 retain_days = 14
 
 # [sentinel]
-# Optional: also ask an Action Sentinel service (github.com/premm25/action-sentinel) what it would decide
-# about each tool call. Shadow mode only records its verdict next to Sluice's; it never changes a decision.
-# Compare them with `sluice sentinel report`.
+# Optional: also ask an Action Sentinel service (github.com/premm25/action-sentinel) about each tool call.
+# mode = "shadow" only records its verdict next to Sluice's and never changes a decision; compare them with
+# `sluice sentinel report`. mode = "enforce" lets Sentinel block calls and hold them for a person's approval.
 # url = "http://127.0.0.1:8000"
 # api_key_env = "SENTINEL_API_KEY"   # the key is read from this environment variable, never from this file
 # agent_id = "mcp-proxy"
+# mode = "shadow"                    # or "enforce"
+# on_error = "block"                 # enforce: what to do when Sentinel can't be reached (block | allow)
 
 # ---- Capability labels -------------------------------------------------------
 # private:   returns data that must not leave (files, mail, databases)
